@@ -1,17 +1,16 @@
 """
-ChatGPT API with improved rate limiting and retry logic
+ChatGPT API Client
 """
 
 import json
 import requests
 import time
-import random
 from typing import Dict, Any, Optional
 
 
 class ChatGPTClient:
-    """ChatGPT API with enhanced error handling and rate limiting"""
-    def __init__(self, api_key: str, model: str = "gpt-4o", config=None):
+    """ChatGPT API Client"""
+    def __init__(self, api_key: str, model: str = "gpt-4o"):
         self.api_key = api_key
         self.model = model
         self.base_url = "https://api.openai.com/v1/chat/completions"
@@ -19,19 +18,6 @@ class ChatGPTClient:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
-        
-        # Load config parameters for retry logic
-        if config:
-            self.max_retries = config.MAX_RETRIES
-            self.backoff_base = config.BACKOFF_BASE
-            self.backoff_cap = config.BACKOFF_CAP
-            self.request_delay = config.REQUEST_DELAY
-        else:
-            # Default values
-            self.max_retries = 6
-            self.backoff_base = 1.8
-            self.backoff_cap = 45
-            self.request_delay = 2.0
 
     def create_prompt(self, case_data: Dict[str, Any]) -> str:
         """Create analysis prompt"""
@@ -74,45 +60,8 @@ Return ONLY the JSON result with no additional text or explanations.
 """
         return prompt
     
-    def _calculate_wait_time(self, attempt: int) -> float:
-        """Calculate exponential backoff wait time with random jitter"""
-        base_wait = min(self.backoff_base ** attempt, self.backoff_cap)
-        # Add random jitter (±20%)
-        jitter = base_wait * 0.2 * (2 * random.random() - 1)
-        return max(1.0, base_wait + jitter)
-    
-    def _handle_rate_limit_error(self, response) -> Optional[int]:
-        """Handle rate limit errors and return suggested wait time"""
-        try:
-            # Check for retry suggestion in response headers
-            retry_after = response.headers.get('Retry-After')
-            if retry_after:
-                return int(retry_after)
-            
-            # Check for error message in response body
-            error_data = response.json()
-            if 'error' in error_data:
-                error_msg = error_data['error'].get('message', '')
-                if 'Rate limit' in error_msg or 'quota' in error_msg.lower():
-                    # Extract wait time from error message
-                    if 'Try again in' in error_msg:
-                        # Example: "Try again in 20s"
-                        import re
-                        match = re.search(r'Try again in (\d+)s', error_msg)
-                        if match:
-                            return int(match.group(1))
-                        # Example: "Try again in 1m12s" 
-                        match = re.search(r'Try again in (\d+)m(\d+)s', error_msg)
-                        if match:
-                            return int(match.group(1)) * 60 + int(match.group(2))
-            
-        except Exception as e:
-            print(f"Exception occurred while parsing rate limit error: {e}")
-        
-        return None
-    
     def analyze_case(self, case_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Analyze case data, call ChatGPT API, and handle various errors"""
+        """Analyze case data with single API call (no retries)"""
         prompt = self.create_prompt(case_data)
         
         payload = {
@@ -127,125 +76,46 @@ Return ONLY the JSON result with no additional text or explanations.
                     "content": prompt
                 }
             ],
-            "max_tokens": 4000,
-            "temperature": 0.1
+            "max_tokens": 600,
+            "temperature": 0,
+            "response_format": {"type": "json_object"}
         }
         
-        for attempt in range(self.max_retries):
-            try:
-                print(f"  API call attempt {attempt + 1}/{self.max_retries}...")
+        try:
+            response = requests.post(
+                self.base_url,
+                headers=self.headers,
+                json=payload,
+                timeout=60
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                content = result['choices'][0]['message']['content']
                 
-                response = requests.post(
-                    self.base_url,
-                    headers=self.headers,
-                    json=payload,
-                    timeout=120  # Increase timeout duration
-                )
-                
-                # Successful response
-                if response.status_code == 200:
-                    try:
-                        result = response.json()
-                        content = result['choices'][0]['message']['content']
-                        
-                        # Clean JSON content
-                        content = content.strip()
-                        if content.startswith('```json'):
-                            content = content[7:]
-                        elif content.startswith('```'):
-                            content = content[3:]
-                        if content.endswith('```'):
-                            content = content[:-3]
-                        content = content.strip()
-                        
-                        # Parse JSON
-                        parsed_result = json.loads(content)
-                        print(f"  ✓ API call successful")
-                        return parsed_result
-                        
-                    except json.JSONDecodeError as e:
-                        print(f"  JSON parsing error (attempt {attempt + 1}): {str(e)}")
-                        print(f"  Response content first 200 characters: {content[:200]}...")
-                        
-                        if attempt == self.max_retries - 1:
-                            print(f"  ✗ All retries failed, JSON parsing error")
-                            return None
-                        
-                        # JSON parsing error, wait briefly and retry
-                        wait_time = 2.0
-                        print(f"  Waiting {wait_time:.1f} seconds before retrying...")
-                        time.sleep(wait_time)
-                        continue
-                
-                # 429 Rate limit error
-                elif response.status_code == 429:
-                    suggested_wait = self._handle_rate_limit_error(response)
+                try:
+                    content = content.strip()
+                    if content.startswith('```json'):
+                        content = content[7:]
+                    if content.endswith('```'):
+                        content = content[:-3]
+                    content = content.strip()
                     
-                    if suggested_wait:
-                        wait_time = min(suggested_wait + 5, self.backoff_cap)  # Add 5 seconds buffer
-                    else:
-                        wait_time = self._calculate_wait_time(attempt)
+                    parsed_result = json.loads(content)
+                    return parsed_result
                     
-                    print(f"  ⚠️ API rate limit (429), waiting {wait_time:.1f} seconds before retrying...")
-                    time.sleep(wait_time)
-                    continue
+                except json.JSONDecodeError as e:
+                    print(f"JSON parsing error: {str(e)}")
+                    print(f"Content preview: {content[:200]}...")
+                    return None
+            
+            else:
+                print(f"API request failed, status code: {response.status_code}")
+                print(f"Error message: {response.text}")
+                return None
                 
-                # 5xx Server error
-                elif response.status_code >= 500:
-                    wait_time = self._calculate_wait_time(attempt)
-                    print(f"  ⚠️ Server error ({response.status_code}), waiting {wait_time:.1f} seconds before retrying...")
-                    time.sleep(wait_time)
-                    continue
-                
-                # 4xx Client error (except 429)
-                elif response.status_code >= 400:
-                    print(f"  ✗ Client error ({response.status_code}): {response.text[:200]}")
-                    return None
-                
-                # Other errors
-                else:
-                    print(f"  ⚠️ Unknown status code ({response.status_code}), attempting retry...")
-                    if attempt < self.max_retries - 1:
-                        wait_time = self._calculate_wait_time(attempt)
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        print(f"  ✗ API request failed, status code: {response.status_code}")
-                        print(f"  Error message: {response.text[:200]}")
-                        return None
-                        
-            except requests.exceptions.Timeout:
-                print(f"  ⚠️ Request timeout (attempt {attempt + 1})")
-                if attempt < self.max_retries - 1:
-                    wait_time = self._calculate_wait_time(attempt)
-                    print(f"  Waiting {wait_time:.1f} seconds before retrying...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    print(f"  ✗ Request timeout, all retries failed")
-                    return None
-                    
-            except requests.exceptions.ConnectionError:
-                print(f"  ⚠️ Connection error (attempt {attempt + 1})")
-                if attempt < self.max_retries - 1:
-                    wait_time = self._calculate_wait_time(attempt)
-                    print(f"  Waiting {wait_time:.1f} seconds before retrying...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    print(f"  ✗ Connection error, all retries failed")
-                    return None
-                    
-            except requests.exceptions.RequestException as e:
-                print(f"  ⚠️ Request exception (attempt {attempt + 1}): {str(e)}")
-                if attempt < self.max_retries - 1:
-                    wait_time = self._calculate_wait_time(attempt)
-                    print(f"  Waiting {wait_time:.1f} seconds before retrying...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    print(f"  ✗ Request exception, all retries failed")
-                    return None
+        except requests.exceptions.RequestException as e:
+            print(f"Request exception: {str(e)}")
+            return None
         
-        print(f"  ✗ Maximum retry attempts reached ({self.max_retries}), API call failed")
         return None
